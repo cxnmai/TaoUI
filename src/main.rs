@@ -100,6 +100,13 @@ impl AngleMode {
             Self::Degrees => value.to_radians(),
         }
     }
+
+    fn from_radians(self, value: f64) -> f64 {
+        match self {
+            Self::Radians => value,
+            Self::Degrees => value.to_degrees(),
+        }
+    }
 }
 
 struct App {
@@ -919,7 +926,7 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
             Line::from("Assignments: name = expression"),
             Line::from("Variables: multi-letter, CaseSensitive, underscore_ok"),
             Line::from("Implicit multiply: 2x, 2(3+4), 3sin(3)"),
-            Line::from("Functions: sin cos tan sqrt root(n,x) abs frac pow"),
+            Line::from("Functions: sin cos tan asin acos atan sqrt root(n,x) abs frac pow"),
         ])
         .style(panel_text_style(bg)),
         inner,
@@ -1028,7 +1035,38 @@ fn token_starts_implicit_product(token: &Token) -> bool {
 fn supported_function_name(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "sin" | "cos" | "tan" | "sqrt" | "abs" | "sq" | "pow" | "frac" | "root" | "nroot"
+        "sin"
+            | "cos"
+            | "tan"
+            | "asin"
+            | "acos"
+            | "atan"
+            | "sqrt"
+            | "abs"
+            | "sq"
+            | "pow"
+            | "frac"
+            | "root"
+            | "nroot"
+    )
+}
+
+fn inverse_trig_name(name: &str) -> Option<&'static str> {
+    match name.to_ascii_lowercase().as_str() {
+        "sin" => Some("asin"),
+        "cos" => Some("acos"),
+        "tan" => Some("atan"),
+        _ => None,
+    }
+}
+
+fn is_inverse_trig_exponent(expr: &Expr) -> bool {
+    matches!(
+        &expr.kind,
+        ExprKind::Unary {
+            op: UnaryOp::Negate,
+            expr,
+        } if matches!(&expr.kind, ExprKind::Number(raw) if raw == "1")
     )
 }
 
@@ -2028,20 +2066,38 @@ impl Parser {
                     if self.matches(TokenKind::LParen) {
                         let args = self.parse_arguments()?;
                         let closing = self.previous_span();
+                        let function_span = SourceSpan::new(span.start, closing.end);
+                        let function_name = if exponent
+                            .as_ref()
+                            .is_some_and(|expr| is_inverse_trig_exponent(expr))
+                        {
+                            inverse_trig_name(&name).unwrap_or(name.as_str()).to_owned()
+                        } else {
+                            name.clone()
+                        };
                         let function = self.make_expr(
-                            SourceSpan::new(span.start, closing.end),
-                            ExprKind::Function { name, args },
+                            function_span,
+                            ExprKind::Function {
+                                name: function_name,
+                                args,
+                            },
                         );
 
                         if let Some(exponent) = exponent {
-                            Ok(self.make_expr(
-                                SourceSpan::new(span.start, closing.end),
-                                ExprKind::Binary {
-                                    op: BinaryOp::Power,
-                                    left: Box::new(function),
-                                    right: Box::new(exponent),
-                                },
-                            ))
+                            if is_inverse_trig_exponent(&exponent)
+                                && inverse_trig_name(&name).is_some()
+                            {
+                                Ok(function)
+                            } else {
+                                Ok(self.make_expr(
+                                    function_span,
+                                    ExprKind::Binary {
+                                        op: BinaryOp::Power,
+                                        left: Box::new(function),
+                                        right: Box::new(exponent),
+                                    },
+                                ))
+                            }
                         } else {
                             Ok(function)
                         }
@@ -2296,6 +2352,15 @@ fn apply_function(name: &str, args: &[f64], context: EvalContext<'_>) -> Result<
         "tan" => unary_function(name, args, |value| {
             Ok(context.angle_mode.to_radians(value).tan())
         }),
+        "asin" => unary_function(name, args, |value| {
+            Ok(context.angle_mode.from_radians(value.asin()))
+        }),
+        "acos" => unary_function(name, args, |value| {
+            Ok(context.angle_mode.from_radians(value.acos()))
+        }),
+        "atan" => unary_function(name, args, |value| {
+            Ok(context.angle_mode.from_radians(value.atan()))
+        }),
         "sqrt" => unary_function(name, args, |value| {
             if value < 0.0 {
                 Err("sqrt domain error".to_owned())
@@ -2424,6 +2489,7 @@ fn render_expression_with_parent(expr: &Expr, parent_precedence: u8) -> MathBloc
 
 fn render_function_expression(name: &str, args: &[Expr]) -> MathBlock {
     match (name, args) {
+        ("asin" | "acos" | "atan", [value]) => render_inverse_trig_function(name, value),
         ("sqrt", [value]) => render_root_block(None, render_expression_with_parent(value, 0)),
         ("root" | "nroot", [index, value]) => render_root_block(
             Some(render_expression_with_parent(index, 4)),
@@ -2461,6 +2527,18 @@ fn render_generic_function(name: &str, args: &[Expr]) -> MathBlock {
     };
 
     join_blocks(&[MathBlock::from_text(name.to_owned()), arguments])
+}
+
+fn render_inverse_trig_function(name: &str, value: &Expr) -> MathBlock {
+    let base = match name {
+        "asin" => "sin",
+        "acos" => "cos",
+        "atan" => "tan",
+        _ => name,
+    };
+    let label = render_power_block(MathBlock::from_text(base), MathBlock::from_text("−1"));
+    let arguments = wrap_parentheses(render_expression_with_parent(value, 0));
+    join_blocks(&[label, arguments])
 }
 
 fn render_identifier(name: &str) -> String {
@@ -2651,6 +2729,27 @@ mod tests {
     }
 
     #[test]
+    fn evaluates_inverse_trig_in_degree_mode() {
+        let value = evaluate("asin(0.5)", 0.0, AngleMode::Degrees).unwrap();
+        approx_eq(value, 30.0);
+    }
+
+    #[test]
+    fn evaluates_inverse_trig_in_radian_mode() {
+        let value = evaluate("acos(0.5)", 0.0, AngleMode::Radians).unwrap();
+        approx_eq(value, std::f64::consts::PI / 3.0);
+    }
+
+    #[test]
+    fn supports_inverse_trig_shorthand() {
+        let value = evaluate("sin^-1(0.5)", 0.0, AngleMode::Degrees).unwrap();
+        approx_eq(value, 30.0);
+
+        let tangent = evaluate("tan^-1(1)", 0.0, AngleMode::Degrees).unwrap();
+        approx_eq(tangent, 45.0);
+    }
+
+    #[test]
     fn evaluates_e_constant() {
         let value = evaluate("e", 0.0, AngleMode::Radians).unwrap();
         approx_eq(value, E);
@@ -2756,6 +2855,16 @@ mod tests {
         assert!(joined.contains('2'));
         assert!(joined.contains("sin"));
         assert!(joined.contains('3'));
+    }
+
+    #[test]
+    fn renders_inverse_trig_as_function_inverse() {
+        let rendered = rendered_lines("asin(0.5)");
+        let joined = rendered.join("\n");
+        assert!(joined.contains("sin"));
+        assert!(joined.contains('−'));
+        assert!(joined.contains('1'));
+        assert!(joined.contains("0.5"));
     }
 
     #[test]
