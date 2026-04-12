@@ -1376,6 +1376,9 @@ fn overwrite_segment(target: &mut String, start: usize, segment: &str) {
     *target = chars.into_iter().collect();
 }
 
+const LARGE_SCIENTIFIC_THRESHOLD: f64 = 1e6;
+const SMALL_SCIENTIFIC_THRESHOLD: f64 = 1e-6;
+
 fn format_number(value: f64) -> String {
     if value.is_nan() {
         return "NaN".to_owned();
@@ -1388,7 +1391,9 @@ fn format_number(value: f64) -> String {
         };
     }
 
-    if value.abs() >= 1e12 {
+    if value.abs() >= LARGE_SCIENTIFIC_THRESHOLD
+        || (value != 0.0 && value.abs() < SMALL_SCIENTIFIC_THRESHOLD)
+    {
         return format_scientific(value);
     }
 
@@ -2817,8 +2822,16 @@ mod tests {
 
     #[test]
     fn formats_huge_numbers_in_scientific_notation() {
+        assert_eq!(format_number(1_000_000.0), "1e6");
+        assert_eq!(format_number(1_234_567.0), "1.234567e6");
         assert_eq!(format_number(1_000_000_000_000.0), "1e12");
         assert_eq!(format_number(1_234_567_890_123.0), "1.2345678901e12");
+    }
+
+    #[test]
+    fn formats_tiny_numbers_in_scientific_notation() {
+        assert_eq!(format_number(0.000000001), "1e-9");
+        assert_eq!(format_number(-0.000000025), "-2.5e-8");
     }
 
     #[test]
