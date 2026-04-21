@@ -281,6 +281,13 @@ impl App {
             return;
         }
 
+        if trimmed == "?" {
+            self.show_help = true;
+            self.clear_input();
+            self.status.clear();
+            return;
+        }
+
         if trimmed.eq_ignore_ascii_case("rad") {
             self.angle_mode = AngleMode::Radians;
             self.status = "Angle mode set to RAD.".to_owned();
@@ -452,6 +459,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // Any keyboard interaction should switch back to cursor-driven highlighting.
+    app.hovered_node = None;
+
     match key.code {
         KeyCode::Esc => app.should_quit = true,
         KeyCode::Enter => app.submit(),
@@ -576,7 +586,12 @@ fn render(frame: &mut Frame, app: &App) -> RenderSnapshot {
                     spans,
                 )
             } else {
-                (render_statement_math(&app.input), Vec::new())
+                let token = render_token_math_with_spans(&app.input);
+                if token.1.is_empty() {
+                    (render_statement_math(&app.input), Vec::new())
+                } else {
+                    token
+                }
             }
         }
         Ok(None) => match parse_expression_input(&app.input) {
@@ -585,9 +600,16 @@ fn render(frame: &mut Frame, app: &App) -> RenderSnapshot {
                 collect_node_spans(&expr, &mut spans);
                 (render_expression(&expr), spans)
             }
-            Err(_) => (render_input_math(&app.input), Vec::new()),
+            Err(_) => render_token_math_with_spans(&app.input),
         },
-        Err(_) => (render_statement_math(&app.input), Vec::new()),
+        Err(_) => {
+            let token = render_token_math_with_spans(&app.input);
+            if token.1.is_empty() {
+                (render_statement_math(&app.input), Vec::new())
+            } else {
+                token
+            }
+        }
     };
 
     let preview = if app.input.trim().is_empty() {
@@ -599,8 +621,9 @@ fn render(frame: &mut Frame, app: &App) -> RenderSnapshot {
         }
     };
 
-    let active_hover = pick_hovered_from_cursor(&node_spans, app.cursor, app.input.chars().count())
-        .or(app.hovered_node);
+    let active_hover = app
+        .hovered_node
+        .or_else(|| pick_hovered_from_cursor(&node_spans, app.cursor, app.input.chars().count()));
 
     let math_height = math.height().max(1) as u16;
     let current_height = math_height + 5;
@@ -917,6 +940,7 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
     frame.render_widget(
         Paragraph::new(vec![
             Line::from("F1: open/close help"),
+            Line::from("?: type `?` then Enter"),
             Line::from("Enter: evaluate"),
             Line::from("Up/Down: recall history"),
             Line::from("F2: toggle RAD/DEG"),
@@ -1056,6 +1080,9 @@ fn inverse_trig_name(name: &str) -> Option<&'static str> {
         "sin" => Some("asin"),
         "cos" => Some("acos"),
         "tan" => Some("atan"),
+        "asin" => Some("asin"),
+        "acos" => Some("acos"),
+        "atan" => Some("atan"),
         _ => None,
     }
 }
@@ -2072,10 +2099,10 @@ impl Parser {
                         let args = self.parse_arguments()?;
                         let closing = self.previous_span();
                         let function_span = SourceSpan::new(span.start, closing.end);
-                        let function_name = if exponent
+                        let is_inverse_exponent = exponent
                             .as_ref()
-                            .is_some_and(|expr| is_inverse_trig_exponent(expr))
-                        {
+                            .is_some_and(|expr| is_inverse_trig_exponent(expr));
+                        let function_name = if is_inverse_exponent {
                             inverse_trig_name(&name).unwrap_or(name.as_str()).to_owned()
                         } else {
                             name.clone()
@@ -2089,9 +2116,7 @@ impl Parser {
                         );
 
                         if let Some(exponent) = exponent {
-                            if is_inverse_trig_exponent(&exponent)
-                                && inverse_trig_name(&name).is_some()
-                            {
+                            if is_inverse_exponent && inverse_trig_name(&name).is_some() {
                                 Ok(function)
                             } else {
                                 Ok(self.make_expr(
@@ -2571,6 +2596,80 @@ fn render_inline_fallback(input: &str) -> String {
         .replace(" e", " ℯ")
 }
 
+fn render_inline_with_prefix_map(input: &str) -> (String, Vec<usize>) {
+    let chars: Vec<char> = input.chars().collect();
+    let mut output = Vec::with_capacity(chars.len());
+    let mut prefix = vec![0_usize; chars.len() + 1];
+    let mut index = 0;
+    let mut out_len = 0;
+
+    while index < chars.len() {
+        prefix[index] = out_len;
+
+        if chars[index] == 'p' && chars.get(index + 1) == Some(&'i') {
+            output.push('π');
+            out_len += 1;
+            index += 2;
+            prefix[index] = out_len;
+            continue;
+        }
+
+        let ch = match chars[index] {
+            '*' => '×',
+            'e' if index > 0 && chars[index - 1] == ' ' => 'ℯ',
+            other => other,
+        };
+        output.push(ch);
+        out_len += 1;
+        index += 1;
+        prefix[index] = out_len;
+    }
+
+    (output.into_iter().collect(), prefix)
+}
+
+fn render_token_math_with_spans(input: &str) -> (MathBlock, Vec<NodeSpan>) {
+    let Ok(tokens) = tokenize(input) else {
+        return (
+            MathBlock::from_text(render_inline_fallback(input)),
+            Vec::new(),
+        );
+    };
+    if tokens.is_empty() {
+        return (
+            MathBlock::from_text(render_inline_fallback(input)),
+            Vec::new(),
+        );
+    }
+
+    let (rendered, prefix) = render_inline_with_prefix_map(input);
+    let mut spans = Vec::new();
+    let mut rects = Vec::new();
+
+    const SYNTHETIC_NODE_BASE: usize = 1_000_000_000;
+    for (token_index, token) in tokens.iter().enumerate() {
+        let node_id = SYNTHETIC_NODE_BASE + token_index;
+        let start = token.span.start.min(prefix.len().saturating_sub(1));
+        let end = token.span.end.min(prefix.len().saturating_sub(1));
+        let render_start = prefix[start];
+        let render_end = prefix[end].max(render_start + 1);
+
+        spans.push(NodeSpan {
+            node_id,
+            span: token.span,
+        });
+        rects.push(NodeRect {
+            node_id,
+            x: render_start,
+            y: 0,
+            width: render_end - render_start,
+            height: 1,
+        });
+    }
+
+    (MathBlock::with_rects(vec![rendered], 0, rects), spans)
+}
+
 fn collect_node_spans(expr: &Expr, output: &mut Vec<NodeSpan>) {
     output.push(NodeSpan {
         node_id: expr.id,
@@ -2881,6 +2980,17 @@ mod tests {
     }
 
     #[test]
+    fn renders_inverse_trig_before_fraction_argument() {
+        let rendered = rendered_lines("cos^-1(1/2)");
+        let joined = rendered.join("\n");
+        assert!(joined.contains("cos"));
+        assert!(joined.contains('−'));
+        assert!(joined.contains('1'));
+        assert!(joined.contains("1"));
+        assert!(joined.contains("2"));
+    }
+
+    #[test]
     fn renders_implicit_function_multiplication_without_a_times_symbol() {
         let rendered = rendered_lines("3sin(3)");
         let joined = rendered.join("\n");
@@ -3075,7 +3185,7 @@ mod tests {
     }
 
     #[test]
-    fn help_is_opened_by_keybind_not_by_command() {
+    fn help_can_be_opened_by_keybind_or_question_mark() {
         let mut app = App::default();
         handle_key(&mut app, KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
         assert!(app.show_help);
@@ -3083,10 +3193,10 @@ mod tests {
         handle_key(&mut app, KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
         assert!(!app.show_help);
 
-        app.input = "help".to_owned();
+        app.input = "?".to_owned();
         app.cursor = app.input.chars().count();
         app.submit();
-        assert!(!app.show_help);
-        assert!(app.status.contains("Error"));
+        assert!(app.show_help);
+        assert_eq!(app.input, "");
     }
 }
