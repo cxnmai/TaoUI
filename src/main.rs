@@ -950,7 +950,7 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
             Line::from("Assignments: name = expression"),
             Line::from("Variables: multi-letter, CaseSensitive, underscore_ok"),
             Line::from("Implicit multiply: 2x, 2(3+4), 3sin(3)"),
-            Line::from("Functions: sin cos tan asin acos atan sqrt root(n,x) abs frac pow"),
+            Line::from("Functions: sin cos tan asin acos atan sqrt root(n,x) log ln abs frac pow"),
         ])
         .style(panel_text_style(bg)),
         inner,
@@ -1068,6 +1068,8 @@ fn supported_function_name(name: &str) -> bool {
             | "sqrt"
             | "abs"
             | "sq"
+            | "log"
+            | "ln"
             | "pow"
             | "frac"
             | "root"
@@ -2400,6 +2402,20 @@ fn apply_function(name: &str, args: &[f64], context: EvalContext<'_>) -> Result<
         }),
         "abs" => unary_function(name, args, |value| Ok(value.abs())),
         "sq" => unary_function(name, args, |value| Ok(value * value)),
+        "log" => unary_function(name, args, |value| {
+            if value <= 0.0 {
+                Err("log domain error".to_owned())
+            } else {
+                Ok(value.log10())
+            }
+        }),
+        "ln" => unary_function(name, args, |value| {
+            if value <= 0.0 {
+                Err("ln domain error".to_owned())
+            } else {
+                Ok(value.ln())
+            }
+        }),
         "pow" => binary_function(name, args, |a, b| Ok(a.powf(b))),
         "frac" => binary_function(name, args, |a, b| {
             if b == 0.0 {
@@ -2908,6 +2924,27 @@ mod tests {
     }
 
     #[test]
+    fn supports_logarithms() {
+        let common = evaluate("log(1000)", 0.0, AngleMode::Degrees).unwrap();
+        approx_eq(common, 3.0);
+
+        let natural = evaluate("ln(e)", 0.0, AngleMode::Degrees).unwrap();
+        approx_eq(natural, 1.0);
+    }
+
+    #[test]
+    fn rejects_logarithm_domain_errors() {
+        assert_eq!(
+            evaluate("log(0)", 0.0, AngleMode::Degrees).unwrap_err(),
+            "log domain error"
+        );
+        assert_eq!(
+            evaluate("ln(-1)", 0.0, AngleMode::Degrees).unwrap_err(),
+            "ln domain error"
+        );
+    }
+
+    #[test]
     fn keeps_power_right_associative() {
         let value = evaluate("2^3^2", 0.0, AngleMode::Degrees).unwrap();
         approx_eq(value, 512.0);
@@ -3020,6 +3057,12 @@ mod tests {
         let rendered = rendered_lines("sqrt(3)+2");
         assert_eq!(rendered.len(), 1);
         assert_eq!(rendered[0], "√3 + 2");
+    }
+
+    #[test]
+    fn renders_logarithms_as_functions() {
+        assert_eq!(rendered_lines("log(100)"), vec!["log(100)"]);
+        assert_eq!(rendered_lines("ln(e)"), vec!["ln(ℯ)"]);
     }
 
     #[test]
